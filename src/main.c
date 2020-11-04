@@ -237,9 +237,15 @@ void process_transfers(libusb_device_handle *handle)
 	unsigned char buffer[BUFSIZE] = { 0 };
 	while (transfer_until_full(t, handle, buffer, BUFSIZE) > 0) {
 		if (buffer[0] & 0x1) {
-			system(VOLUP_COMMAND);
+			if (system(VOLUP_COMMAND)) {
+				fprintf(stderr, "system() exited with"
+						"non-zero\n");
+			}
 		} else if (buffer[0] & 0x2) {
-			system(VOLDOWN_COMMAND);
+			if (system(VOLDOWN_COMMAND)) {
+				fprintf(stderr, "system() exited with"
+						"non-zero\n");
+			}
 		}
 #if LOG_UNKNOWN_MESSAGES
 		else {
