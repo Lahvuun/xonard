@@ -139,13 +139,6 @@ int process_epoll_err(int r, int *bytes_read,
 	return is_sigint;
 }
 
-/**
- * Perform a USB interrupt transfer.
- *
- * Blocks until either one of libusb's fds is ready or a SIGTERM is
- * received. Returns number of bytes read, one of LIBUSB_ERROR*, one of
- * epoll_wait's errors, or -EINTR if got a signal.
- */
 int perform_transfer_blocking(struct libusb_transfer *transfer,
 			      libusb_device_handle *handle,
 			      unsigned char *buffer, int length)
