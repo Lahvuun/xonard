@@ -33,12 +33,12 @@ void handle_sigterm(int sig __attribute__((unused)))
 
 void log_fail(char *func_name)
 {
-	printf("%s() failed\n", func_name);
+	fprintf(stderr, "%s() failed\n", func_name);
 }
 
 void log_fail_with(char *func_name, int error_num)
 {
-	printf("%s() failed with: %d\n", func_name, error_num);
+	fprintf(stderr, "%s() failed with: %d\n", func_name, error_num);
 }
 
 uint32_t poll_events_to_epoll(short events)
@@ -125,7 +125,7 @@ int process_epoll_err(int r, int *bytes_read,
 	if (EINTR != errno) {
 		log_fail_with("epoll_wait", r);
 	} else {
-		printf("got SIGTERM, exiting\n");
+		fprintf(stderr, "got SIGTERM, exiting\n");
 		is_sigint = true;
 		if (!*bytes_read) {
 			r = libusb_cancel_transfer(transfer);
@@ -243,11 +243,11 @@ void process_transfers(libusb_device_handle *handle)
 		}
 #if LOG_UNKNOWN_MESSAGES
 		else {
-			printf("read bytes: ");
+			fprintf(stderr, "read bytes: ");
 			for (size_t i = 0; i < BUFSIZE; ++i) {
-				printf("%hhx", buffer[i]);
+				fprintf(stderr, "%hhx", buffer[i]);
 			}
-			printf("\n");
+			fprintf(stderr, "\n");
 		}
 #endif
 	}
@@ -274,7 +274,8 @@ int process_input(libusb_device_handle *handle)
 		dprintf(READINESS_NOTIFICATION_FD, "\n");
 		close(READINESS_NOTIFICATION_FD);
 	} else {
-		printf("readiness notification fd is unavailable\n");
+		fprintf(stderr,
+			"readiness notification fd is unavailable\n");
 	}
 
 	process_transfers(handle);
