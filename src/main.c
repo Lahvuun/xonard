@@ -101,47 +101,25 @@ void process_transfer_data(struct libusb_transfer *transfer)
 	}
 }
 
-ssize_t empty_fd(int fd, ssize_t bufsize)
+/**
+ * @brief Run epoll_wait() and return the value. If it's interrupted by
+ * a signal, @p got_signal is set to true.
+ */
+static int epoll_wait_with_signal(bool *got_signal)
 {
-	uint8_t buf[bufsize];
-	ssize_t r = -1;
-	ssize_t r_total = 0;
-	while (r_total < bufsize) {
-		r = read(fd, buf, (size_t)(bufsize - r_total));
-		if (r < 0) {
-			log_fail("read");
-			return r;
-		}
-		r_total += r;
+	struct epoll_event events[1];
+	int errno_saved = errno;
+	int r = epoll_wait(epoll_fd, events, 1, -1);
+	if (r < 0 && EINTR == errno) {
+		*got_signal = true;
 	}
-	return r_total;
+	errno = errno_saved;
+	return r;
 }
 
-int process_epoll_err(int r, int *bytes_read,
-		      struct libusb_transfer *transfer)
-{
-	bool is_sigint = false;
-
-	if (EINTR != errno) {
-		log_fail_with("epoll_wait", r);
-	} else {
-		fprintf(stderr, "got SIGTERM, exiting\n");
-		is_sigint = true;
-		if (!*bytes_read) {
-			r = libusb_cancel_transfer(transfer);
-			if (r) {
-				log_fail_with("libusb_cancel_transfer",
-					      r);
-				return r;
-			}
-		}
-	}
-	return is_sigint;
-}
-
-int perform_transfer_blocking(struct libusb_transfer *transfer,
-			      libusb_device_handle *handle,
-			      unsigned char *buffer, int length)
+static int perform_transfer_blocking(struct libusb_transfer *transfer,
+				     libusb_device_handle *handle,
+				     unsigned char *buffer, int length)
 {
 	int bytes_read = 0;
 	libusb_fill_interrupt_transfer(
@@ -154,18 +132,21 @@ int perform_transfer_blocking(struct libusb_transfer *transfer,
 	}
 
 	bool is_sigint = false;
-	struct epoll_event events[1];
 	do {
-		int errno_saved = errno;
-		r = epoll_wait(epoll_fd, events, 1, -1);
-		if (r < 0) {
-			is_sigint = process_epoll_err(r, &bytes_read,
-						      transfer);
-			if (!is_sigint) {
+		r = epoll_wait_with_signal(&is_sigint);
+		if (r < 0 && !is_sigint) {
+			log_fail_with("epoll_wait", r);
+			return r;
+		}
+
+		if (is_sigint) {
+			r = libusb_cancel_transfer(transfer);
+			if (r) {
+				log_fail_with("libusb_cancel_transfer",
+					      r);
 				return r;
 			}
 		}
-		errno = errno_saved;
 
 		struct timeval tv = {
 			.tv_sec = 0,
@@ -178,8 +159,9 @@ int perform_transfer_blocking(struct libusb_transfer *transfer,
 				      r);
 			return r;
 		}
+
 		if (is_sigint) {
-			return -1;
+			return -EINTR;
 		}
 	} while (!bytes_read);
 
