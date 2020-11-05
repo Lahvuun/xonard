@@ -37,8 +37,17 @@ enum OutputState {
 
 int epoll_fd = -1;
 
-void handle_sigterm(int sig __attribute__((unused)))
+volatile sig_atomic_t got_sigterm = 0;
+
+void handle_sigterm(int sig)
 {
+	switch(sig) {
+	case SIGTERM:
+		got_sigterm = 1;
+		break;
+	default:
+		fprintf(stderr, "got signal: %d\n", sig);
+	}
 }
 
 void log_fail(char *func_name)
@@ -121,7 +130,11 @@ static int epoll_wait_with_signal(bool *got_signal)
 	int errno_saved = errno;
 	int r = epoll_wait(epoll_fd, events, 1, -1);
 	if (r < 0 && EINTR == errno) {
-		*got_signal = true;
+		if (got_sigterm) {
+			*got_signal = true;
+		} else {
+			r = 0;
+		}
 	}
 	errno = errno_saved;
 	return r;
@@ -141,15 +154,15 @@ static int perform_transfer_blocking(struct libusb_transfer *transfer,
 		return r;
 	}
 
-	bool is_sigint = false;
+	bool got_signal = false;
 	do {
-		r = epoll_wait_with_signal(&is_sigint);
-		if (r < 0 && !is_sigint) {
+		r = epoll_wait_with_signal(&got_signal);
+		if (r < 0 && !got_signal) {
 			log_fail_with("epoll_wait", r);
 			return r;
 		}
 
-		if (is_sigint) {
+		if (got_signal) {
 			r = libusb_cancel_transfer(transfer);
 			if (r) {
 				log_fail_with("libusb_cancel_transfer",
@@ -170,8 +183,8 @@ static int perform_transfer_blocking(struct libusb_transfer *transfer,
 			return r;
 		}
 
-		if (is_sigint) {
-			fprintf(stderr, "exiting due to SIGINT\n");
+		if (got_signal) {
+			fprintf(stderr, "exiting due to signal\n");
 			return -EINTR;
 		}
 	} while (!bytes_read);
