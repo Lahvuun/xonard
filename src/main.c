@@ -12,7 +12,7 @@
 
 #include <libusb.h>
 
-#define LOG_UNKNOWN_MESSAGES 0
+#define LOG_MESSAGES 0
 #define VOLUP_COMMAND "pactl set-sink-volume @DEFAULT_SINK@ +1%"
 #define VOLDOWN_COMMAND "pactl set-sink-volume @DEFAULT_SINK@ -1%"
 
@@ -22,6 +22,16 @@
 #define VENDOR 0x0b05
 #define PRODUCT 0x183c
 #define INTERFACE_NUM 4
+
+enum ButtonState {
+	BUTTON_VOLUP = 1,
+	BUTTON_VOLDOWN = 1 << 1,
+};
+
+enum OutputState {
+	OUTPUT_HEADPHONE = 1 << 4,
+	OUTPUT_SPEAKER = 1 << 7,
+};
 
 #define BUFSIZE 16
 
@@ -186,6 +196,44 @@ int transfer_until_full(struct libusb_transfer *transfer,
 	return r_total;
 }
 
+void process_message(unsigned char *buffer,
+		     enum OutputState *output_state)
+{
+	enum ButtonState buttons = (buffer[0] & BUTTON_VOLUP)
+				   | (buffer[0] & BUTTON_VOLDOWN);
+	if (buttons) {
+		if (buttons & BUTTON_VOLUP) {
+			if (system(VOLUP_COMMAND)) {
+				fprintf(stderr, "system() exited with"
+						"non-zero\n");
+			}
+		}
+		if (buttons & BUTTON_VOLDOWN) {
+			if (system(VOLDOWN_COMMAND)) {
+				fprintf(stderr, "system() exited with"
+						"non-zero\n");
+			}
+		}
+	}
+
+	unsigned char output_curr = (buffer[10] & OUTPUT_HEADPHONE)
+				    | (buffer[10] & OUTPUT_SPEAKER);
+	if (output_curr != *output_state) {
+		*output_state = output_curr;
+		fprintf(stderr, "output switched to %s\n",
+			*output_state == OUTPUT_HEADPHONE ?
+				      "headphone" :
+				      "speaker");
+	}
+#if LOG_MESSAGES
+	fprintf(stderr, "read bytes: ");
+	for (size_t i = 0; i < BUFSIZE; ++i) {
+		fprintf(stderr, "%hhx", buffer[i]);
+	}
+	fprintf(stderr, "\n");
+#endif
+}
+
 void process_transfers(libusb_device_handle *handle)
 {
 	libusb_set_pollfd_notifiers(NULL, process_pollfd_added,
@@ -210,27 +258,10 @@ void process_transfers(libusb_device_handle *handle)
 	}
 
 	unsigned char buffer[BUFSIZE] = { 0 };
+	// TODO: request current state on program start.
+	enum OutputState output_state = OUTPUT_SPEAKER;
 	while (transfer_until_full(t, handle, buffer, BUFSIZE) > 0) {
-		if (buffer[0] & 0x1) {
-			if (system(VOLUP_COMMAND)) {
-				fprintf(stderr, "system() exited with"
-						"non-zero\n");
-			}
-		} else if (buffer[0] & 0x2) {
-			if (system(VOLDOWN_COMMAND)) {
-				fprintf(stderr, "system() exited with"
-						"non-zero\n");
-			}
-		}
-#if LOG_UNKNOWN_MESSAGES
-		else {
-			fprintf(stderr, "read bytes: ");
-			for (size_t i = 0; i < BUFSIZE; ++i) {
-				fprintf(stderr, "%hhx", buffer[i]);
-			}
-			fprintf(stderr, "\n");
-		}
-#endif
+		process_message(buffer, &output_state);
 	}
 
 	libusb_free_transfer(t);
