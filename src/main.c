@@ -171,6 +171,7 @@ static int perform_transfer_blocking(struct libusb_transfer *transfer,
 		}
 
 		if (is_sigint) {
+			fprintf(stderr, "exiting due to SIGINT\n");
 			return -EINTR;
 		}
 	} while (!bytes_read);
@@ -289,6 +290,7 @@ int process_input(libusb_device_handle *handle)
 		fprintf(stderr,
 			"readiness notification fd is unavailable\n");
 	}
+	fprintf(stderr, "up and running\n");
 
 	process_transfers(handle);
 
