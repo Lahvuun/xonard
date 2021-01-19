@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/epoll.h>
 
 #include <libusb.h>
 
@@ -21,7 +20,13 @@
 
 #define VENDOR 0x0b05
 #define PRODUCT 0x183c
+
 #define INTERFACE_NUM 4
+
+#define BUFSIZE 16
+
+struct pollfd *libusb_fds = NULL;
+size_t libusb_fds_num = 0;
 
 enum ButtonState {
 	BUTTON_VOLUP = 1,
@@ -33,15 +38,11 @@ enum OutputState {
 	OUTPUT_SPEAKER = 1 << 7,
 };
 
-#define BUFSIZE 16
-
-int epoll_fd = -1;
-
 volatile sig_atomic_t got_sigterm = 0;
 
-void handle_sigterm(int sig)
+static void handle_sigterm(int sig)
 {
-	switch(sig) {
+	switch (sig) {
 	case SIGTERM:
 		got_sigterm = 1;
 		break;
@@ -50,167 +51,12 @@ void handle_sigterm(int sig)
 	}
 }
 
-void log_fail(char *func_name)
+static void log_fail(char *func_name)
 {
 	fprintf(stderr, "%s() failed\n", func_name);
 }
 
-void log_fail_with(char *func_name, int error_num)
-{
-	fprintf(stderr, "%s() failed with: %d\n", func_name, error_num);
-}
-
-uint32_t poll_events_to_epoll(short events)
-{
-	uint32_t epoll_events = 0;
-	if (events & POLLIN) {
-		epoll_events |= EPOLLIN;
-	}
-	if (events & POLLOUT) {
-		epoll_events |= EPOLLOUT;
-	}
-	return epoll_events;
-}
-
-int add_pollfd_to_epoll(int fd, short events)
-{
-	struct epoll_event ev = {
-		.events = poll_events_to_epoll(events),
-		.data = { .fd = fd },
-	};
-	int errno_saved = errno;
-	errno = 0;
-	int r = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
-	if (r && EEXIST != errno) {
-		log_fail_with("epoll_ctl", r);
-	}
-	errno = errno_saved;
-	return r;
-}
-
-void process_pollfd_added(int fd, short events,
-			  void *user_data __attribute__((unused)))
-{
-	add_pollfd_to_epoll(fd, events);
-}
-
-void process_pollfd_removed(int fd,
-			    void *user_data __attribute__((unused)))
-{
-	int errno_saved = errno;
-	errno = 0;
-	int r = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-	// EBADF is *probably* fine.
-	if (r && EBADF != errno) {
-		log_fail_with("epoll_ctl", r);
-	}
-	errno = errno_saved;
-}
-
-void process_transfer_data(struct libusb_transfer *transfer)
-{
-	int *bytes_read = transfer->user_data;
-	if (LIBUSB_TRANSFER_COMPLETED == transfer->status) {
-		*bytes_read = transfer->actual_length;
-	} else if (LIBUSB_TRANSFER_CANCELLED == transfer->status) {
-		*bytes_read = LIBUSB_TRANSFER_CANCELLED;
-		raise(SIGTERM);
-	} else {
-		*bytes_read = -1;
-	}
-}
-
-/**
- * @brief Run epoll_wait() and return the value. If it's interrupted by
- * a signal, @p got_signal is set to true.
- */
-static int epoll_wait_with_signal(bool *got_signal)
-{
-	struct epoll_event events[1];
-	int errno_saved = errno;
-	int r = epoll_wait(epoll_fd, events, 1, -1);
-	if (r < 0 && EINTR == errno) {
-		if (got_sigterm) {
-			*got_signal = true;
-		} else {
-			r = 0;
-		}
-	}
-	errno = errno_saved;
-	return r;
-}
-
-static int perform_transfer_blocking(struct libusb_transfer *transfer,
-				     libusb_device_handle *handle,
-				     unsigned char *buffer, int length)
-{
-	int bytes_read = 0;
-	libusb_fill_interrupt_transfer(
-		transfer, handle, INTERFACE_NUM | LIBUSB_ENDPOINT_IN,
-		buffer, length, process_transfer_data, &bytes_read, 0);
-	int r = libusb_submit_transfer(transfer);
-	if (r) {
-		log_fail_with("libusb_submit_transfer", r);
-		return r;
-	}
-
-	bool got_signal = false;
-	do {
-		r = epoll_wait_with_signal(&got_signal);
-		if (r < 0 && !got_signal) {
-			log_fail_with("epoll_wait", r);
-			return r;
-		}
-
-		if (got_signal) {
-			r = libusb_cancel_transfer(transfer);
-			if (r) {
-				log_fail_with("libusb_cancel_transfer",
-					      r);
-				return r;
-			}
-		}
-
-		struct timeval tv = {
-			.tv_sec = 0,
-			.tv_usec = 0,
-		};
-		r = libusb_handle_events_timeout_completed(NULL, &tv,
-							   NULL);
-		if (r) {
-			log_fail_with("libusb_handle_events_completed",
-				      r);
-			return r;
-		}
-
-		if (got_signal) {
-			fprintf(stderr, "exiting due to signal\n");
-			return -EINTR;
-		}
-	} while (!bytes_read);
-
-	return bytes_read;
-}
-
-int transfer_until_full(struct libusb_transfer *transfer,
-			libusb_device_handle *handle,
-			unsigned char *buffer, int length)
-{
-	int r = 0;
-	int r_total = 0;
-	while (r_total < length) {
-		r = perform_transfer_blocking(transfer, handle,
-					      buffer + r_total,
-					      length - r_total);
-		if (r < 0) {
-			return r;
-		}
-		r_total += r;
-	}
-	return r_total;
-}
-
-void process_message(unsigned char *buffer,
+static void process_message(unsigned char *buffer,
 		     enum OutputState *output_state)
 {
 	enum ButtonState buttons = (buffer[0] & BUTTON_VOLUP)
@@ -248,41 +94,120 @@ void process_message(unsigned char *buffer,
 #endif
 }
 
+void handle_transfer_completion(struct libusb_transfer *transfer)
+{
+	int *result = transfer->user_data;
+	switch (transfer->status) {
+	case LIBUSB_TRANSFER_COMPLETED:
+		*result = transfer->actual_length;
+		break;
+	default:
+		*result = -1;
+	}
+}
+
+int perform_transfer_until_buffer_full(unsigned char *buffer, struct libusb_device_handle *handle, struct libusb_transfer *transfer)
+{
+	int r = 0;
+	int result = -2;
+	int total_read = 0;
+	while (total_read < BUFSIZE) {
+		libusb_fill_interrupt_transfer(transfer, handle, INTERFACE_NUM | LIBUSB_ENDPOINT_IN, buffer + total_read, BUFSIZE - total_read, handle_transfer_completion, &result, 0);
+
+		libusb_submit_transfer(transfer);
+
+		r = poll(libusb_fds, libusb_fds_num, -1);
+		if (-1 == r) {
+			if (EINTR == errno) {
+				fprintf(stderr, "got EINTR\n");
+			}
+			libusb_cancel_transfer(transfer);
+		}
+
+		struct timeval tv = {
+			.tv_sec = 0,
+			.tv_usec = 0,
+		};
+		r = libusb_handle_events_timeout_completed(NULL, &tv, NULL);
+		if (r == LIBUSB_ERROR_INTERRUPTED && got_sigterm) {
+			return -1;
+		}
+
+		if (-1 == result) {
+			return -1;
+		}
+
+		if (-2 != result) {
+			total_read += result;
+		}
+	}
+
+	return total_read;
+}
+
 void process_transfers(libusb_device_handle *handle)
 {
-	libusb_set_pollfd_notifiers(NULL, process_pollfd_added,
-				    process_pollfd_removed, NULL);
-
-	const struct libusb_pollfd **pollfds = libusb_get_pollfds(NULL);
-	if (!pollfds) {
-		log_fail("libusb_get_pollfds");
-		return;
-	}
-	const struct libusb_pollfd **pollfds_pos = pollfds;
-	for (; *pollfds_pos; ++pollfds_pos) {
-		const struct libusb_pollfd *pollfd = *pollfds_pos;
-		add_pollfd_to_epoll(pollfd->fd, pollfd->events);
-	}
-	libusb_free_pollfds(pollfds);
-
-	struct libusb_transfer *t = libusb_alloc_transfer(0);
-	if (!t) {
-		log_fail("libusb_alloc_transfer");
-		return;
-	}
+	struct libusb_transfer *transfer = libusb_alloc_transfer(0);
 
 	unsigned char buffer[BUFSIZE] = { 0 };
-	// TODO: request current state on program start.
+	int result = perform_transfer_until_buffer_full(buffer, handle, transfer);
+	// TODO: query the device.
 	enum OutputState output_state = OUTPUT_SPEAKER;
-	while (transfer_until_full(t, handle, buffer, BUFSIZE) > 0) {
+	while (BUFSIZE == result) {
 		process_message(buffer, &output_state);
+		result = perform_transfer_until_buffer_full(buffer, handle, transfer);
 	}
 
-	libusb_free_transfer(t);
+	if (got_sigterm) {
+		fprintf(stderr, "exiting due to SIGTERM\n");
+	}
+
+	libusb_free_transfer(transfer);
+}
+
+void handle_pollfd_added(int fd, short events, __attribute__((unused))void *user_data)
+{
+	struct pollfd *new_fds = calloc(libusb_fds_num + 1, sizeof(struct pollfd));
+	memcpy(new_fds, libusb_fds, sizeof(struct pollfd) * libusb_fds_num);
+	free(libusb_fds);
+	libusb_fds = new_fds;
+	libusb_fds[libusb_fds_num].fd = fd;
+	libusb_fds[libusb_fds_num].events = events;
+	++libusb_fds_num;
+}
+
+void handle_pollfd_removed(int fd, __attribute__((unused))void *user_data)
+{
+	struct pollfd *new_fds = calloc(libusb_fds_num - 1, sizeof(struct pollfd));
+	size_t i = 0;
+	while (libusb_fds[i].fd != fd) {
+		++i;
+	}
+	memcpy(new_fds, libusb_fds, sizeof(struct pollfd) * i);
+	if (i < libusb_fds_num - 1) {
+		memcpy(new_fds + i, libusb_fds + i + 1, libusb_fds_num - i);
+	}
+	free(libusb_fds);
+	libusb_fds = new_fds;
+	--libusb_fds_num;
 }
 
 int process_input(libusb_device_handle *handle)
 {
+	const struct libusb_pollfd **fds = libusb_get_pollfds(NULL);
+	size_t fds_count = 0;
+	while (fds[fds_count]) {
+		++fds_count;
+	}
+	libusb_fds = calloc(fds_count, sizeof(struct pollfd));
+	for (size_t i = 0; i < fds_count; ++i) {
+		libusb_fds[i].fd = fds[i]->fd;
+		libusb_fds[i].events = fds[i]->events;
+	}
+	libusb_fds_num = fds_count;
+	libusb_free_pollfds(fds);
+	libusb_set_pollfd_notifiers(NULL, handle_pollfd_added, handle_pollfd_removed, NULL);
+
 	int r = libusb_set_auto_detach_kernel_driver(handle, 1);
 	if (r) {
 		log_fail("libusb_set_auto_detach_kernel_driver");
@@ -305,6 +230,13 @@ int process_input(libusb_device_handle *handle)
 	}
 	fprintf(stderr, "up and running\n");
 
+	signal(SIGTERM, handle_sigterm);
+
+	sigset_t sigset;
+	sigemptyset(&sigset);
+	sigaddset(&sigset, SIGTERM);
+	sigprocmask(SIG_UNBLOCK, &sigset, NULL);
+
 	process_transfers(handle);
 
 	r = libusb_release_interface(handle, INTERFACE_NUM);
@@ -316,18 +248,15 @@ int process_input(libusb_device_handle *handle)
 
 int main(void)
 {
-	signal(SIGTERM, handle_sigterm);
-
-	epoll_fd = epoll_create1(0);
-	if (-1 == epoll_fd) {
-		log_fail("epoll_create1");
-		return EXIT_FAILURE;
-	}
+	sigset_t sigset;
+	sigemptyset(&sigset);
+	sigaddset(&sigset, SIGTERM);
+	sigprocmask(SIG_SETMASK, &sigset, NULL);
 
 	int r = libusb_init(NULL);
 	if (r) {
 		log_fail("libusb_init");
-		goto cleanup_epoll;
+		return EXIT_FAILURE;
 	}
 
 	r = libusb_set_option(NULL, LIBUSB_OPTION_LOG_LEVEL,
@@ -349,8 +278,6 @@ int main(void)
 	libusb_close(handle);
 cleanup:
 	libusb_exit(NULL);
-cleanup_epoll:
-	close(epoll_fd);
 	if (r) {
 		return EXIT_FAILURE;
 	}
