@@ -101,7 +101,13 @@ void handle_transfer_completion(struct libusb_transfer *transfer)
 	case LIBUSB_TRANSFER_COMPLETED:
 		*result = transfer->actual_length;
 		break;
+	case LIBUSB_TRANSFER_NO_DEVICE:
+		// TODO: wait for device to reconnect.
+		fprintf(stderr, "device disconnected\n");
+		*result = -1;
+		break;
 	default:
+		fprintf(stderr, "got unexpected transfer status: %d\n", transfer->status);
 		*result = -1;
 	}
 }
@@ -118,6 +124,7 @@ int perform_transfer_until_buffer_full(unsigned char *buffer, struct libusb_devi
 
 		r = poll(libusb_fds, libusb_fds_num, -1);
 		if (-1 == r) {
+			fprintf(stderr, "poll got -1\n");
 			if (EINTR == errno) {
 				fprintf(stderr, "got EINTR\n");
 			}
@@ -129,6 +136,9 @@ int perform_transfer_until_buffer_full(unsigned char *buffer, struct libusb_devi
 			.tv_usec = 0,
 		};
 		r = libusb_handle_events_timeout_completed(NULL, &tv, NULL);
+		if (r) {
+			log_fail("libusb_handle_events_timeout_completed");
+		}
 		if (r == LIBUSB_ERROR_INTERRUPTED && got_sigterm) {
 			return -1;
 		}
